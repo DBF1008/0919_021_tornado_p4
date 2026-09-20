@@ -1,5 +1,6 @@
 import collections
 import errno
+import itertools
 import logging
 import os
 import re
@@ -11,11 +12,12 @@ from contextlib import closing
 
 from tornado import gen, version
 from tornado.escape import to_unicode, utf8
+from tornado.http1connection import HTTP1ServerConnection
 from tornado.httpclient import AsyncHTTPClient, HTTPResponse
 from tornado.httpserver import HTTPServer
 from tornado.httputil import HTTPHeaders, ResponseStartLine
 from tornado.ioloop import IOLoop
-from tornado.iostream import UnsatisfiableReadError
+from tornado.iostream import IOStream, UnsatisfiableReadError
 from tornado.locks import Event
 from tornado.log import gen_log
 from tornado.netutil import Resolver, bind_sockets
@@ -23,6 +25,7 @@ from tornado.simple_httpclient import (
     HTTPStreamClosedError,
     HTTPTimeoutError,
     SimpleAsyncHTTPClient,
+    _ConnectionPool,
 )
 from tornado.test import httpclient_test
 from tornado.test.httpclient_test import (
@@ -883,3 +886,442 @@ class ChunkedWithContentLengthTest(AsyncHTTPTestCase):
         ):
             with self.assertRaises(HTTPStreamClosedError):
                 self.fetch("/chunkwithcl", raise_error=True)
+
+
+class SocketpairHTTPTestCase(AsyncTestCase):
+    """Run a SimpleAsyncHTTPClient against an in-process HTTPServer.
+
+    Uses ``socket.socketpair`` instead of a listening TCP socket so the
+    tests also work in restricted environments where ``bind()`` is not
+    permitted. ``TCPClient.connect`` is patched to hand out the client
+    end of a fresh socketpair whose server end is wired to an
+    `HTTP1ServerConnection`.
+    """
+
+    def get_app(self) -> Application:
+        raise NotImplementedError()
+
+    def get_client_kwargs(self) -> dict:
+        return {}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.server = HTTPServer(self.get_app())
+        self.http_client = SimpleAsyncHTTPClient(
+            force_instance=True, **self.get_client_kwargs()
+        )
+        self._streams: list[IOStream] = []
+        self.server_streams: list[IOStream] = []
+        self.http_client.tcp_client.connect = self._fake_connect
+
+    def tearDown(self) -> None:
+        self.http_client.close()
+        for stream in self._streams:
+            stream.close()
+        super().tearDown()
+
+    async def _fake_connect(self, *args, **kwargs):
+        client_sock, server_sock = socket.socketpair()
+        client_stream = IOStream(client_sock)
+        server_stream = IOStream(server_sock)
+        self._streams.extend([client_stream, server_stream])
+        self.server_streams.append(server_stream)
+        conn = HTTP1ServerConnection(server_stream, self.server.conn_params, None)
+        self.server._connections.add(conn)
+        conn.start_serving(self.server)
+        return client_stream
+
+    def fetch(self, path: str, **kwargs):
+        return self.http_client.fetch("http://example.com" + path, **kwargs)
+
+    def pool_size(self, client=None) -> int:
+        if client is None:
+            client = self.http_client
+        return sum(len(q) for q in client._connection_pool._idle.values())
+
+
+class ConnectionPoolTestCase(SocketpairHTTPTestCase):
+    def get_app(self):
+        counter = itertools.count()
+
+        class ConnectionIdHandler(RequestHandler):
+            def get(self):
+                # The server-side IOStream lives as long as the
+                # underlying TCP connection, so it identifies the
+                # connection this request arrived on.
+                stream = self.request.connection.stream
+                if not hasattr(stream, "_test_connection_id"):
+                    stream._test_connection_id = next(counter)
+                self.write(str(stream._test_connection_id))
+
+        class ConnectionHeaderHandler(RequestHandler):
+            def get(self):
+                self.write(self.request.headers.get("Connection", "none"))
+
+        class CloseHandler(RequestHandler):
+            def get(self):
+                self.set_header("Connection", "close")
+                self.write("closing")
+
+        return Application(
+            [
+                ("/connection_id", ConnectionIdHandler),
+                ("/connection_header", ConnectionHeaderHandler),
+                ("/close", CloseHandler),
+            ]
+        )
+
+    @gen_test
+    def test_connection_reused(self):
+        first = yield self.fetch("/connection_id")
+        second = yield self.fetch("/connection_id")
+        self.assertEqual(first.body, second.body)
+        self.assertEqual(len(self.server_streams), 1)
+
+    @gen_test
+    def test_keep_alive_by_default(self):
+        # With pooling enabled no "Connection: close" header is sent.
+        response = yield self.fetch("/connection_header")
+        self.assertEqual(response.body, b"none")
+
+    @gen_test
+    def test_pooling_disabled(self):
+        client = SimpleAsyncHTTPClient(force_instance=True, max_idle_connections=0)
+        client.tcp_client.connect = self._fake_connect
+        try:
+            first = yield client.fetch("http://example.com/connection_id")
+            second = yield client.fetch("http://example.com/connection_id")
+            self.assertNotEqual(first.body, second.body)
+            # With pooling disabled the client asks the server to close
+            # the connection after each request.
+            header = yield client.fetch("http://example.com/connection_header")
+            self.assertEqual(header.body, b"close")
+        finally:
+            client.close()
+
+    @gen_test
+    def test_remote_close_evicted(self):
+        first = yield self.fetch("/connection_id")
+        self.assertEqual(self.pool_size(), 1)
+        # Simulate the remote peer closing the idle connection; the
+        # pool's close callback must remove it automatically.
+        for stream in self.server_streams:
+            stream.close()
+        yield gen.sleep(0.1)
+        self.assertEqual(self.pool_size(), 0)
+        second = yield self.fetch("/connection_id")
+        self.assertNotEqual(first.body, second.body)
+
+    @gen_test
+    def test_idle_timeout(self):
+        client = SimpleAsyncHTTPClient(force_instance=True, idle_timeout=0.1)
+        client.tcp_client.connect = self._fake_connect
+        try:
+            first = yield client.fetch("http://example.com/connection_id")
+            yield gen.sleep(0.3)
+            self.assertEqual(self.pool_size(client), 0)
+            second = yield client.fetch("http://example.com/connection_id")
+            self.assertNotEqual(first.body, second.body)
+        finally:
+            client.close()
+
+    @gen_test
+    def test_max_idle_connections(self):
+        client = SimpleAsyncHTTPClient(force_instance=True, max_idle_connections=1)
+        client.tcp_client.connect = self._fake_connect
+        try:
+            # Two concurrent requests need two connections, but only one
+            # may remain in the pool afterwards.
+            yield [
+                client.fetch("http://example.com/connection_id"),
+                client.fetch("http://example.com/connection_id"),
+            ]
+            yield gen.sleep(0.1)
+            self.assertEqual(self.pool_size(client), 1)
+        finally:
+            client.close()
+
+    @gen_test
+    def test_max_clients_still_enforced(self):
+        client = SimpleAsyncHTTPClient(force_instance=True, max_clients=1)
+        client.tcp_client.connect = self._fake_connect
+        try:
+            yield [
+                client.fetch("http://example.com/connection_id"),
+                client.fetch("http://example.com/connection_id"),
+            ]
+            # max_clients=1 serializes the requests, so both reuse a
+            # single pooled connection.
+            self.assertEqual(len(self.server_streams), 1)
+        finally:
+            client.close()
+
+    @gen_test
+    def test_connection_close_response_not_pooled(self):
+        response = yield self.fetch("/close")
+        self.assertEqual(response.body, b"closing")
+        yield gen.sleep(0.1)
+        self.assertEqual(self.pool_size(), 0)
+
+    @gen_test
+    def test_per_request_pooling_disabled(self):
+        first = yield self.fetch("/connection_id", max_idle_connections=0)
+        second = yield self.fetch("/connection_id")
+        self.assertNotEqual(first.body, second.body)
+
+
+class ConnectionPoolUnitTestCase(AsyncTestCase):
+    """Unit tests for _ConnectionPool that do not require a server."""
+
+    def make_pool(self):
+        pool = _ConnectionPool(self.io_loop)
+        self.addCleanup(pool.close)
+        return pool
+
+    def make_stream_pair(self):
+        client_sock, server_sock = socket.socketpair()
+        client_stream = IOStream(client_sock)
+        server_stream = IOStream(server_sock)
+        self.addCleanup(client_stream.close)
+        self.addCleanup(server_stream.close)
+        return client_stream, server_stream
+
+    @gen_test
+    def test_put_get(self):
+        pool = self.make_pool()
+        stream, _ = self.make_stream_pair()
+        key = ("example.com", 80, False)
+        pool.put(key, stream, max_idle_connections=10, idle_timeout=60)
+        self.assertIs(pool.get(key), stream)
+        self.assertIsNone(pool.get(key))
+
+    @gen_test
+    def test_get_skips_closed_streams(self):
+        pool = self.make_pool()
+        stream, _ = self.make_stream_pair()
+        key = ("example.com", 80, False)
+        pool.put(key, stream, max_idle_connections=10, idle_timeout=60)
+        stream.close()
+        self.assertIsNone(pool.get(key))
+
+    @gen_test
+    def test_remote_close_evicted(self):
+        pool = self.make_pool()
+        client_stream, server_stream = self.make_stream_pair()
+        key = ("example.com", 443, True)
+        pool.put(key, client_stream, max_idle_connections=10, idle_timeout=60)
+        # Simulate the remote peer closing the idle connection; the
+        # pool's close callback must remove it automatically.
+        server_stream.close()
+        yield gen.sleep(0.1)
+        self.assertIsNone(pool.get(key))
+        self.assertEqual(len(pool._idle), 0)
+
+    @gen_test
+    def test_idle_timeout(self):
+        pool = self.make_pool()
+        stream, _ = self.make_stream_pair()
+        key = ("example.com", 80, False)
+        pool.put(key, stream, max_idle_connections=10, idle_timeout=0.05)
+        yield gen.sleep(0.2)
+        self.assertTrue(stream.closed())
+        self.assertIsNone(pool.get(key))
+
+    @gen_test
+    def test_max_idle_connections(self):
+        pool = self.make_pool()
+        key = ("example.com", 80, False)
+        streams = [self.make_stream_pair()[0] for _ in range(3)]
+        for stream in streams:
+            pool.put(key, stream, max_idle_connections=2, idle_timeout=60)
+        self.assertEqual(len(pool._idle[key]), 2)
+        # The oldest stream was evicted and closed.
+        self.assertTrue(streams[0].closed())
+        self.assertFalse(streams[1].closed())
+        self.assertFalse(streams[2].closed())
+
+    @gen_test
+    def test_zero_max_idle_connections(self):
+        pool = self.make_pool()
+        stream, _ = self.make_stream_pair()
+        pool.put(
+            ("example.com", 80, False),
+            stream,
+            max_idle_connections=0,
+            idle_timeout=60,
+        )
+        self.assertTrue(stream.closed())
+        self.assertEqual(len(pool._idle), 0)
+
+    @gen_test
+    def test_pool_close(self):
+        pool = self.make_pool()
+        stream, _ = self.make_stream_pair()
+        pool.put(("example.com", 80, False), stream, 10, 60)
+        pool.close()
+        self.assertTrue(stream.closed())
+        # Streams returned after the pool is closed are closed instead.
+        stream2, _ = self.make_stream_pair()
+        pool.put(("example.com", 80, False), stream2, 10, 60)
+        self.assertTrue(stream2.closed())
+
+
+class RetryTestCase(SocketpairHTTPTestCase):
+    def get_app(self):
+        counters = {"flaky": 0, "always_error": 0}
+
+        class FlakyHandler(RequestHandler):
+            def get(self):
+                counters["flaky"] += 1
+                if counters["flaky"] < 3:
+                    self.set_status(500)
+                    self.write("error")
+                else:
+                    self.write("ok")
+
+        class AlwaysErrorHandler(RequestHandler):
+            def get(self):
+                counters["always_error"] += 1
+                self.set_status(500)
+                self.write("error")
+
+        self.counters = counters
+        return Application(
+            [("/flaky", FlakyHandler), ("/always_error", AlwaysErrorHandler)]
+        )
+
+    @gen_test
+    def test_retry_recovers(self):
+        response = yield self.fetch(
+            "/flaky", max_retries=3, retry_backoff_base=0.01
+        )
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.body, b"ok")
+        self.assertEqual(self.counters["flaky"], 3)
+
+    @gen_test
+    def test_retry_exhausted(self):
+        response = yield self.fetch(
+            "/always_error",
+            max_retries=2,
+            retry_backoff_base=0.01,
+            raise_error=False,
+        )
+        self.assertEqual(response.code, 500)
+        # 1 initial attempt + 2 retries.
+        self.assertEqual(self.counters["always_error"], 3)
+
+    @gen_test
+    def test_no_retry_by_default(self):
+        response = yield self.fetch("/always_error", raise_error=False)
+        self.assertEqual(response.code, 500)
+        self.assertEqual(self.counters["always_error"], 1)
+
+    @gen_test
+    def test_retry_backoff_waits(self):
+        start = self.io_loop.time()
+        response = yield self.fetch(
+            "/always_error",
+            max_retries=2,
+            retry_backoff_base=0.1,
+            raise_error=False,
+        )
+        elapsed = self.io_loop.time() - start
+        self.assertEqual(response.code, 500)
+        # Two retries with delays 0.1*1*jitter and 0.1*2*jitter where
+        # jitter >= 0.5, so at least 0.15s must have elapsed. Use a
+        # conservative lower bound to avoid flakiness.
+        self.assertGreaterEqual(elapsed, 0.1)
+
+    @gen_test
+    def test_retry_stream_closed(self):
+        # A peer that closes the connection without responding triggers
+        # StreamClosedError, which is retried.
+        accepts = []
+
+        async def fake_connect(*args, **kwargs):
+            client_sock, server_sock = socket.socketpair()
+            client_stream = IOStream(client_sock)
+            server_stream = IOStream(server_sock)
+            self._streams.extend([client_stream, server_stream])
+            accepts.append(server_stream)
+
+            async def read_and_close():
+                try:
+                    await server_stream.read_until(b"\r\n\r\n")
+                finally:
+                    server_stream.close()
+
+            self.io_loop.spawn_callback(read_and_close)
+            return client_stream
+
+        self.http_client.tcp_client.connect = fake_connect
+        # Note that raise_error=False does not suppress network-level
+        # errors (only HTTP error responses), so the final failure is
+        # raised after all retries are exhausted.
+        with self.assertRaises(HTTPStreamClosedError):
+            yield self.fetch("/", max_retries=2, retry_backoff_base=0.01)
+        self.assertEqual(len(accepts), 3)
+
+
+class BodyTruncationTestCase(SocketpairHTTPTestCase):
+    def get_client_kwargs(self):
+        return {"body_truncate_threshold": 1024 * 10}
+
+    def get_app(self):
+        class LargeBodyHandler(RequestHandler):
+            def get(self):
+                self.write("a" * (1024 * 100))
+
+        class ChunkedBodyHandler(RequestHandler):
+            @gen.coroutine
+            def get(self):
+                for _ in range(20):
+                    self.write("b" * 1024)
+                    yield self.flush()
+
+        class SmallBodyHandler(RequestHandler):
+            def get(self):
+                self.write("ok")
+
+        return Application(
+            [
+                ("/large", LargeBodyHandler),
+                ("/chunked", ChunkedBodyHandler),
+                ("/small", SmallBodyHandler),
+            ]
+        )
+
+    @gen_test
+    def test_truncated_fixed_body(self):
+        response = yield self.fetch("/large")
+        self.assertTrue(response.truncated)
+        self.assertEqual(response.body, b"a" * (1024 * 10))
+
+    @gen_test
+    def test_truncated_chunked_body(self):
+        response = yield self.fetch("/chunked")
+        self.assertTrue(response.truncated)
+        self.assertEqual(response.body, b"b" * (1024 * 10))
+
+    @gen_test
+    def test_small_body_not_truncated(self):
+        response = yield self.fetch("/small")
+        self.assertFalse(response.truncated)
+        self.assertEqual(response.body, b"ok")
+
+    @gen_test
+    def test_per_request_threshold_override(self):
+        response = yield self.fetch("/large", body_truncate_threshold=1024 * 200)
+        self.assertFalse(response.truncated)
+        self.assertEqual(response.body, b"a" * (1024 * 100))
+
+    @gen_test
+    def test_connection_reusable_after_truncation(self):
+        # The remainder of a truncated body is read and discarded, so
+        # the connection stays correctly framed and can be reused.
+        response = yield self.fetch("/large")
+        self.assertTrue(response.truncated)
+        response = yield self.fetch("/small")
+        self.assertFalse(response.truncated)
+        self.assertEqual(response.body, b"ok")
