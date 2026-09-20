@@ -71,14 +71,133 @@ class HTTPStreamClosedError(HTTPError):
         return self.message or "Stream closed"
 
 
+class _IdleConnection:
+    """A keep-alive connection sitting idle in an `HTTPConnectionPool`."""
+
+    __slots__ = ("stream", "timeout_handle")
+
+    def __init__(self, stream: IOStream) -> None:
+        self.stream = stream
+        self.timeout_handle: object = None
+
+
+class HTTPConnectionPool:
+    """Pool of reusable keep-alive connections.
+
+    Connections are keyed by a ``(host, port, is_ssl)`` tuple.  While a
+    connection is idle its `~.IOStream.set_close_callback` is used to
+    detect a close by the remote peer (or a local error) so that dead
+    connections are removed from the pool automatically.  Idle
+    connections are also closed after ``idle_timeout`` seconds, and the
+    number of idle connections per key is limited to
+    ``max_idle_connections``.
+    """
+
+    def __init__(self) -> None:
+        self._idle: dict[tuple[str, int, bool], collections.deque[_IdleConnection]] = (
+            {}
+        )
+        self._closed = False
+
+    def get(self, key: tuple[str, int, bool]) -> IOStream | None:
+        """Return a cached connection for ``key``, or None."""
+        queue = self._idle.get(key)
+        while queue:
+            conn = queue.popleft()
+            self._cancel_idle_timeout(conn)
+            stream = conn.stream
+            stream.set_close_callback(None)
+            if not stream.closed():
+                return stream
+        if queue is not None and not queue:
+            del self._idle[key]
+        return None
+
+    def put(
+        self,
+        key: tuple[str, int, bool],
+        stream: IOStream,
+        max_idle_connections: int,
+        idle_timeout: float,
+    ) -> None:
+        """Return a connection to the pool (or close it if it cannot be kept)."""
+        if self._closed or stream.closed() or max_idle_connections <= 0:
+            stream.close()
+            return
+        queue = self._idle.setdefault(key, collections.deque())
+        while len(queue) >= max_idle_connections:
+            self._close_connection(queue.popleft())
+        conn = _IdleConnection(stream)
+        io_loop = stream.io_loop
+        if idle_timeout:
+            conn.timeout_handle = io_loop.add_timeout(
+                io_loop.time() + idle_timeout,
+                functools.partial(self._on_idle_timeout, key, conn),
+            )
+        # set_close_callback arms the IOStream's idle read listener, so
+        # a remote close is detected even though no read is pending.
+        stream.set_close_callback(functools.partial(self._on_remote_close, key, conn))
+        queue.append(conn)
+
+    def close(self) -> None:
+        """Close all pooled connections."""
+        self._closed = True
+        for queue in self._idle.values():
+            for conn in queue:
+                self._cancel_idle_timeout(conn)
+                conn.stream.set_close_callback(None)
+                conn.stream.close()
+        self._idle.clear()
+
+    def _cancel_idle_timeout(self, conn: _IdleConnection) -> None:
+        if conn.timeout_handle is not None:
+            conn.stream.io_loop.remove_timeout(conn.timeout_handle)
+            conn.timeout_handle = None
+
+    def _close_connection(self, conn: _IdleConnection) -> None:
+        self._cancel_idle_timeout(conn)
+        conn.stream.set_close_callback(None)
+        conn.stream.close()
+
+    def _remove(self, key: tuple[str, int, bool], conn: _IdleConnection) -> bool:
+        queue = self._idle.get(key)
+        if queue is None:
+            return False
+        try:
+            queue.remove(conn)
+        except ValueError:
+            return False
+        self._cancel_idle_timeout(conn)
+        if not queue:
+            del self._idle[key]
+        return True
+
+    def _on_remote_close(
+        self, key: tuple[str, int, bool], conn: _IdleConnection
+    ) -> None:
+        self._remove(key, conn)
+
+    def _on_idle_timeout(
+        self, key: tuple[str, int, bool], conn: _IdleConnection
+    ) -> None:
+        conn.timeout_handle = None
+        if self._remove(key, conn):
+            conn.stream.set_close_callback(None)
+            conn.stream.close()
+
+
 class SimpleAsyncHTTPClient(AsyncHTTPClient):
     """Non-blocking HTTP client with no external dependencies.
 
     This class implements an HTTP 1.1 client on top of Tornado's IOStreams.
     Some features found in the curl-based AsyncHTTPClient are not yet
-    supported.  In particular, proxies are not supported, connections
-    are not reused, and callers cannot select the network interface to be
-    used.
+    supported.  In particular, proxies are not supported, and callers
+    cannot select the network interface to be used.
+
+    Keep-alive connections are reused through a connection pool keyed by
+    ``(host, port, is_ssl)``.  Idle pooled connections are closed
+    automatically when the remote peer closes them or after
+    ``idle_timeout`` seconds.
 
     This implementation supports the following arguments, which can be passed
     to ``configure()`` to control the global singleton, or to the constructor
@@ -106,6 +225,18 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
     applies; with a ``streaming_callback`` only ``max_body_size``
     does.
 
+    ``max_idle_connections`` (default 10) is the maximum number of idle
+    keep-alive connections kept in the connection pool for each
+    ``(host, port, is_ssl)`` tuple.  Set to 0 to disable connection
+    reuse.  ``idle_timeout`` (default 60 seconds) is how long an idle
+    pooled connection is kept before it is closed.
+
+    ``body_truncation_threshold`` (defaults to ``max_buffer_size``)
+    applies only when ``max_body_size`` is not set: response bodies
+    larger than this many bytes are truncated instead of being loaded
+    into memory in full, and the resulting `~.HTTPResponse` has its
+    ``truncated`` attribute set to True.
+
     .. versionchanged:: 4.2
         Added the ``max_body_size`` argument.
     """
@@ -119,6 +250,9 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         defaults: dict[str, Any] | None = None,
         max_header_size: int | None = None,
         max_body_size: int | None = None,
+        max_idle_connections: int = 10,
+        idle_timeout: float = 60.0,
+        body_truncation_threshold: int | None = None,
     ) -> None:
         super().initialize(defaults=defaults)
         self.max_clients = max_clients
@@ -134,6 +268,10 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
         self.max_buffer_size = max_buffer_size
         self.max_header_size = max_header_size
         self.max_body_size = max_body_size
+        self.max_idle_connections = max_idle_connections
+        self.idle_timeout = idle_timeout
+        self.body_truncation_threshold = body_truncation_threshold
+        self.connection_pool = HTTPConnectionPool()
         # TCPClient could create a Resolver for us, but we have to do it
         # ourselves to support hostname_mapping.
         if resolver:
@@ -150,6 +288,7 @@ class SimpleAsyncHTTPClient(AsyncHTTPClient):
 
     def close(self) -> None:
         super().close()
+        self.connection_pool.close()
         if self.own_resolver:
             self.resolver.close()
         self.tcp_client.close()
@@ -273,6 +412,11 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         self.headers: httputil.HTTPHeaders | None = None
         self.chunks: list[bytes] = []
         self._decompressor = None
+        self._truncated = False
+        self._received_bytes = 0
+        self._response_version: str | None = None
+        self._pool_key: tuple[str, int, bool] | None = None
+        self._pooling_enabled = False
         # Timeout handle returned by IOLoop.add_timeout
         self._timeout: object = None
         self._sockaddr = None
@@ -330,14 +474,22 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                     self.start_time + timeout,
                     functools.partial(self._on_timeout, "while connecting"),
                 )
-            stream = await self.tcp_client.connect(
-                host,
-                port,
-                af=af,
-                ssl_options=ssl_options,
-                max_buffer_size=self.max_buffer_size,
-                source_ip=source_ip,
-            )
+            self._pool_key = (host, port, self.parsed.scheme == "https")
+            max_idle_connections, _ = self._pool_config()
+            self._pooling_enabled = max_idle_connections > 0
+            stream = None
+            if self._pooling_enabled:
+                assert self.client is not None
+                stream = self.client.connection_pool.get(self._pool_key)
+            if stream is None:
+                stream = await self.tcp_client.connect(
+                    host,
+                    port,
+                    af=af,
+                    ssl_options=ssl_options,
+                    max_buffer_size=self.max_buffer_size,
+                    source_ip=source_ip,
+                )
 
             if self.final_callback is None:
                 # final_callback is cleared if we've hit our timeout.
@@ -367,7 +519,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             ):
                 if getattr(self.request, key, None):
                     raise NotImplementedError("%s not supported" % key)
-            if "Connection" not in self.request.headers:
+            if "Connection" not in self.request.headers and not self._pooling_enabled:
                 self.request.headers["Connection"] = "close"
             if "Host" not in self.request.headers:
                 if "@" in self.parsed.netloc:
@@ -489,15 +641,43 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             self.io_loop.remove_timeout(self._timeout)
             self._timeout = None
 
+    def _pool_config(self) -> tuple[int, float]:
+        max_idle_connections = self.request.max_idle_connections
+        if max_idle_connections is None:
+            assert self.client is not None
+            max_idle_connections = self.client.max_idle_connections
+        idle_timeout = self.request.idle_timeout
+        if idle_timeout is None:
+            assert self.client is not None
+            idle_timeout = self.client.idle_timeout
+        return max_idle_connections, idle_timeout
+
+    def _truncation_threshold(self) -> int | None:
+        # When max_body_size is set it remains a hard limit enforced by
+        # HTTP1Connection; truncation only applies when it is unset.
+        if self.max_body_size is not None:
+            return None
+        threshold = self.request.body_truncation_threshold
+        if threshold is None and self.client is not None:
+            threshold = self.client.body_truncation_threshold
+        if threshold is None:
+            threshold = self.max_buffer_size
+        return threshold
+
     def _create_connection(self, stream: IOStream) -> HTTP1Connection:
         stream.set_nodelay(True)
+        max_body_size = self.max_body_size
+        if max_body_size is None:
+            # No hard limit: oversized bodies are truncated by this
+            # class instead, so don't let HTTP1Connection raise first.
+            max_body_size = sys.maxsize
         connection = HTTP1Connection(
             stream,
             True,
             HTTP1ConnectionParameters(
                 no_keep_alive=True,
                 max_header_size=self.max_header_size,
-                max_body_size=self.max_body_size,
+                max_body_size=max_body_size,
                 decompress=bool(self.request.decompress_response),
             ),
             self._sockaddr,
@@ -538,6 +718,15 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         value: BaseException | None,
         tb: TracebackType | None,
     ) -> bool:
+        if (
+            self._truncated
+            and self.code is not None
+            and self.final_callback is not None
+        ):
+            # The body was truncated on purpose and the stream closed;
+            # deliver the partial response instead of an error.
+            self.finish()
+            return True
         if self.final_callback is not None:
             self._remove_timeout()
             if isinstance(value, StreamClosedError):
@@ -570,6 +759,9 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
 
     def on_connection_close(self) -> None:
         if self.final_callback is not None:
+            if self._truncated and self.code is not None:
+                self.finish()
+                return
             message = "Connection closed"
             if self.stream.error:
                 raise self.stream.error
@@ -590,6 +782,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         self.code = first_line.code
         self.reason = first_line.reason
         self.headers = headers
+        self._response_version = first_line.version
 
         if self._should_follow_redirect():
             return
@@ -617,7 +810,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
         data = b"".join(self.chunks)
         self._remove_timeout()
         original_request = getattr(self.request, "original_request", self.request)
-        if self._should_follow_redirect():
+        if not self._truncated and self._should_follow_redirect():
             assert isinstance(self.request, _RequestProxy)
             assert self.headers is not None
             new_request = copy.copy(self.request.request)
@@ -691,10 +884,10 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             final_callback = self.final_callback
             self.final_callback = None  # type: ignore
             self._release()
+            self._on_end_request()
             assert self.client is not None
             fut = self.client.fetch(new_request, raise_error=False)
             fut.add_done_callback(lambda f: final_callback(f.result()))
-            self._on_end_request()
             return
         if self.request.streaming_callback:
             buffer = BytesIO()
@@ -709,12 +902,62 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             start_time=self.start_wall_time,
             buffer=buffer,
             effective_url=self.request.url,
+            truncated=self._truncated,
         )
-        self._run_callback(response)
         self._on_end_request()
+        self._run_callback(response)
 
     def _on_end_request(self) -> None:
-        self.stream.close()
+        stream = getattr(self, "stream", None)
+        if stream is None:
+            return
+        if self._pooling_enabled and self.client is not None and not stream.closed():
+            # Defer the pool put: HTTP1Connection clears the stream's
+            # close callback after finish() returns, so the pool's
+            # callback must only be installed once it is done.
+            self.io_loop.add_callback(self._release_to_pool, stream)
+        else:
+            stream.close()
+
+    def _release_to_pool(self, stream: IOStream) -> None:
+        if self._connection_reusable(stream):
+            assert self.client is not None
+            assert self._pool_key is not None
+            max_idle_connections, idle_timeout = self._pool_config()
+            self.client.connection_pool.put(
+                self._pool_key, stream, max_idle_connections, idle_timeout
+            )
+        else:
+            stream.close()
+
+    def _connection_reusable(self, stream: IOStream) -> bool:
+        if not self._pooling_enabled or self.client is None:
+            return False
+        if self._truncated or stream.closed():
+            return False
+        headers = self.headers
+        if headers is None:
+            return False
+        connection_header = headers.get("Connection", "").lower()
+        if "close" in connection_header:
+            return False
+        if "close" in self.request.headers.get("Connection", "").lower():
+            return False
+        if self._response_version == "HTTP/1.0" and "keep-alive" not in connection_header:
+            return False
+        code = self.code
+        if code is None:
+            return False
+        # The connection can only be reused if the end of the response
+        # body was delimited (otherwise we would have to read until
+        # close, which consumes the connection).
+        if code in (204, 304) or self.request.method == "HEAD" or 100 <= code < 200:
+            return True
+        if "Content-Length" in headers:
+            return True
+        if "chunked" in headers.get("Transfer-Encoding", "").lower():
+            return True
+        return False
 
     def data_received(self, chunk: bytes) -> Awaitable[None] | None:
         if self._should_follow_redirect():
@@ -722,9 +965,23 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
             return None
         if self.request.streaming_callback is not None:
             return self.request.streaming_callback(chunk)
-        else:
-            self.chunks.append(chunk)
+        if self._truncated:
             return None
+        threshold = self._truncation_threshold()
+        if threshold is not None:
+            self._received_bytes += len(chunk)
+            if self._received_bytes > threshold:
+                keep = len(chunk) - (self._received_bytes - threshold)
+                if keep > 0:
+                    self.chunks.append(chunk[:keep])
+                self._truncated = True
+                # Abort the rest of the body; the response is completed
+                # with truncated=True when the close is observed.
+                if self.stream is not None and not self.stream.closed():
+                    self.stream.close()
+                return None
+        self.chunks.append(chunk)
+        return None
 
 
 if __name__ == "__main__":

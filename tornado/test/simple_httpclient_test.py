@@ -15,11 +15,12 @@ from tornado.httpclient import AsyncHTTPClient, HTTPResponse
 from tornado.httpserver import HTTPServer
 from tornado.httputil import HTTPHeaders, ResponseStartLine
 from tornado.ioloop import IOLoop
-from tornado.iostream import UnsatisfiableReadError
+from tornado.iostream import StreamClosedError, UnsatisfiableReadError
 from tornado.locks import Event
 from tornado.log import gen_log
 from tornado.netutil import Resolver, bind_sockets
 from tornado.simple_httpclient import (
+    HTTPConnectionPool,
     HTTPStreamClosedError,
     HTTPTimeoutError,
     SimpleAsyncHTTPClient,
@@ -883,3 +884,286 @@ class ChunkedWithContentLengthTest(AsyncHTTPTestCase):
         ):
             with self.assertRaises(HTTPStreamClosedError):
                 self.fetch("/chunkwithcl", raise_error=True)
+
+
+class _FakeStream:
+    """Minimal IOStream stand-in for HTTPConnectionPool unit tests."""
+
+    def __init__(self, io_loop):
+        self.io_loop = io_loop
+        self._closed = False
+        self.close_callback = None
+
+    def closed(self):
+        return self._closed
+
+    def set_close_callback(self, callback):
+        self.close_callback = callback
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            callback = self.close_callback
+            self.close_callback = None
+            if callback is not None:
+                self.io_loop.add_callback(callback)
+
+
+class HTTPConnectionPoolUnitTestCase(AsyncTestCase):
+    def test_get_returns_idle_connection(self):
+        pool = HTTPConnectionPool()
+        stream = _FakeStream(self.io_loop)
+        key = ("example.com", 80, False)
+        pool.put(key, stream, max_idle_connections=10, idle_timeout=60)
+        self.assertIs(pool.get(key), stream)
+        # The pool is now empty and the close callback was disarmed.
+        self.assertIsNone(stream.close_callback)
+        self.assertIsNone(pool.get(key))
+
+    def test_get_skips_closed_connections(self):
+        pool = HTTPConnectionPool()
+        stream = _FakeStream(self.io_loop)
+        key = ("example.com", 80, False)
+        pool.put(key, stream, max_idle_connections=10, idle_timeout=60)
+        stream._closed = True  # closed without firing the close callback
+        self.assertIsNone(pool.get(key))
+
+    def test_keys_are_independent(self):
+        pool = HTTPConnectionPool()
+        http_stream = _FakeStream(self.io_loop)
+        ssl_stream = _FakeStream(self.io_loop)
+        pool.put(("example.com", 80, False), http_stream, 10, 60)
+        pool.put(("example.com", 443, True), ssl_stream, 10, 60)
+        self.assertIs(pool.get(("example.com", 443, True)), ssl_stream)
+        self.assertIs(pool.get(("example.com", 80, False)), http_stream)
+        self.assertIsNone(pool.get(("example.com", 443, True)))
+
+    def test_max_idle_connections_evicts_oldest(self):
+        pool = HTTPConnectionPool()
+        key = ("example.com", 80, False)
+        streams = [_FakeStream(self.io_loop) for _ in range(3)]
+        for stream in streams:
+            pool.put(key, stream, max_idle_connections=2, idle_timeout=60)
+        self.assertTrue(streams[0].closed())
+        self.assertFalse(streams[1].closed())
+        self.assertFalse(streams[2].closed())
+        self.assertIs(pool.get(key), streams[1])
+        self.assertIs(pool.get(key), streams[2])
+        self.assertIsNone(pool.get(key))
+
+    def test_put_with_zero_max_idle_closes_stream(self):
+        pool = HTTPConnectionPool()
+        stream = _FakeStream(self.io_loop)
+        pool.put(("example.com", 80, False), stream, 0, 60)
+        self.assertTrue(stream.closed())
+
+    @gen_test
+    def test_remote_close_evicts_connection(self):
+        pool = HTTPConnectionPool()
+        stream = _FakeStream(self.io_loop)
+        key = ("example.com", 80, False)
+        pool.put(key, stream, max_idle_connections=10, idle_timeout=60)
+        stream.close()  # simulate the remote peer closing the connection
+        yield gen.sleep(0.01)
+        self.assertIsNone(pool.get(key))
+
+    @gen_test
+    def test_idle_timeout_closes_connection(self):
+        pool = HTTPConnectionPool()
+        stream = _FakeStream(self.io_loop)
+        key = ("example.com", 80, False)
+        pool.put(key, stream, max_idle_connections=10, idle_timeout=0.05)
+        self.assertFalse(stream.closed())
+        yield gen.sleep(0.15)
+        self.assertTrue(stream.closed())
+        self.assertIsNone(pool.get(key))
+
+    def test_close_closes_all_connections(self):
+        pool = HTTPConnectionPool()
+        streams = [_FakeStream(self.io_loop) for _ in range(2)]
+        pool.put(("example.com", 80, False), streams[0], 10, 60)
+        pool.put(("example.com", 443, True), streams[1], 10, 60)
+        pool.close()
+        self.assertTrue(all(stream.closed() for stream in streams))
+        # After close the pool refuses new entries.
+        extra = _FakeStream(self.io_loop)
+        pool.put(("example.com", 80, False), extra, 10, 60)
+        self.assertTrue(extra.closed())
+
+
+class ConnectionIdHandler(RequestHandler):
+    next_id = 0
+
+    def get(self):
+        conn = self.request.connection
+        conn_id = getattr(conn, "_test_connection_id", None)
+        if conn_id is None:
+            conn_id = ConnectionIdHandler.next_id
+            ConnectionIdHandler.next_id += 1
+            conn._test_connection_id = conn_id
+        self.finish(str(conn_id))
+
+
+class ConnectionPoolTestCase(AsyncHTTPTestCase):
+    def get_app(self):
+        return Application([("/connection_id", ConnectionIdHandler)])
+
+    def setUp(self):
+        super().setUp()
+        self.client = SimpleAsyncHTTPClient(force_instance=True)
+        self.addCleanup(self.client.close)
+
+    def pooled_connection_count(self):
+        return sum(
+            len(queue) for queue in self.client.connection_pool._idle.values()
+        )
+
+    @gen_test
+    def test_connection_reused(self):
+        url = self.get_url("/connection_id")
+        first = yield self.client.fetch(url)
+        self.assertEqual(self.pooled_connection_count(), 1)
+        second = yield self.client.fetch(url)
+        self.assertEqual(first.body, second.body)
+
+    @gen_test
+    def test_pool_disabled_with_zero_max_idle(self):
+        client = SimpleAsyncHTTPClient(force_instance=True, max_idle_connections=0)
+        self.addCleanup(client.close)
+        url = self.get_url("/connection_id")
+        first = yield client.fetch(url)
+        self.assertEqual(
+            sum(len(q) for q in client.connection_pool._idle.values()), 0
+        )
+        second = yield client.fetch(url)
+        self.assertNotEqual(first.body, second.body)
+
+    @gen_test
+    def test_request_level_pool_override(self):
+        url = self.get_url("/connection_id")
+        yield self.client.fetch(url, max_idle_connections=0)
+        self.assertEqual(self.pooled_connection_count(), 0)
+        # The client-level default still applies to other requests.
+        yield self.client.fetch(url)
+        self.assertEqual(self.pooled_connection_count(), 1)
+
+    @gen_test
+    def test_max_idle_connections_limit(self):
+        client = SimpleAsyncHTTPClient(
+            force_instance=True, max_clients=5, max_idle_connections=1
+        )
+        self.addCleanup(client.close)
+        url = self.get_url("/connection_id")
+        responses = yield [client.fetch(url) for _ in range(4)]
+        self.assertEqual(len({response.body for response in responses}), 4)
+        self.assertEqual(
+            sum(len(q) for q in client.connection_pool._idle.values()), 1
+        )
+
+    @gen_test
+    def test_idle_timeout(self):
+        client = SimpleAsyncHTTPClient(force_instance=True, idle_timeout=0.1)
+        self.addCleanup(client.close)
+        yield client.fetch(self.get_url("/connection_id"))
+        self.assertEqual(
+            sum(len(q) for q in client.connection_pool._idle.values()), 1
+        )
+        yield gen.sleep(0.3)
+        self.assertEqual(
+            sum(len(q) for q in client.connection_pool._idle.values()), 0
+        )
+
+    @gen_test
+    def test_dead_connection_evicted(self):
+        yield self.client.fetch(self.get_url("/connection_id"))
+        self.assertEqual(self.pooled_connection_count(), 1)
+        queue = list(self.client.connection_pool._idle.values())[0]
+        queue[0].stream.close()  # simulate the server closing the connection
+        yield gen.sleep(0.01)
+        self.assertEqual(self.pooled_connection_count(), 0)
+        # The next request transparently uses a fresh connection.
+        response = yield self.client.fetch(self.get_url("/connection_id"))
+        self.assertEqual(response.code, 200)
+
+
+class LargeBodyHandler(RequestHandler):
+    @gen.coroutine
+    def get(self):
+        self.set_header("Content-Length", str(1024 * 1024))
+        try:
+            for _ in range(64):
+                self.write(b"x" * 16384)
+                yield self.flush()
+        except StreamClosedError:
+            pass
+
+
+class ChunkedLargeBodyHandler(RequestHandler):
+    @gen.coroutine
+    def get(self):
+        try:
+            for _ in range(64):
+                self.write(b"y" * 16384)
+                yield self.flush()
+        except StreamClosedError:
+            pass
+
+
+class SmallBodyHandler(RequestHandler):
+    def get(self):
+        self.finish("hello")
+
+
+class BodyTruncationTestCase(AsyncHTTPTestCase):
+    def get_app(self):
+        return Application(
+            [
+                ("/large", LargeBodyHandler),
+                ("/chunked", ChunkedLargeBodyHandler),
+                ("/small", SmallBodyHandler),
+            ]
+        )
+
+    def setUp(self):
+        super().setUp()
+        self.client = SimpleAsyncHTTPClient(
+            force_instance=True, body_truncation_threshold=1024
+        )
+        self.addCleanup(self.client.close)
+
+    @gen_test
+    def test_truncated_response(self):
+        response = yield self.client.fetch(self.get_url("/large"))
+        self.assertTrue(response.truncated)
+        self.assertEqual(len(response.body), 1024)
+        self.assertEqual(response.code, 200)
+
+    @gen_test
+    def test_truncated_chunked_response(self):
+        response = yield self.client.fetch(self.get_url("/chunked"))
+        self.assertTrue(response.truncated)
+        self.assertEqual(len(response.body), 1024)
+
+    @gen_test
+    def test_small_body_not_truncated(self):
+        response = yield self.client.fetch(self.get_url("/small"))
+        self.assertFalse(response.truncated)
+        self.assertEqual(response.body, b"hello")
+
+    @gen_test
+    def test_request_level_threshold(self):
+        client = SimpleAsyncHTTPClient(force_instance=True)
+        self.addCleanup(client.close)
+        response = yield client.fetch(
+            self.get_url("/large"), body_truncation_threshold=2048
+        )
+        self.assertTrue(response.truncated)
+        self.assertEqual(len(response.body), 2048)
+
+    @gen_test
+    def test_max_body_size_still_hard_limit(self):
+        client = SimpleAsyncHTTPClient(force_instance=True, max_body_size=1024)
+        self.addCleanup(client.close)
+        response = yield client.fetch(self.get_url("/large"), raise_error=False)
+        self.assertEqual(response.code, 599)
+        self.assertFalse(response.truncated)

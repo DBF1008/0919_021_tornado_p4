@@ -15,6 +15,7 @@ from io import BytesIO
 from tornado.escape import utf8, native_str, to_unicode, json_encode, json_decode
 from tornado import gen, netutil
 from tornado.httpclient import (
+    AsyncHTTPClient,
     HTTPClient,
     HTTPError,
     HTTPRequest,
@@ -24,10 +25,16 @@ from tornado.httpclient import (
 from tornado.httpserver import HTTPServer
 from tornado.httputil import HTTPHeaders, format_timestamp
 from tornado.ioloop import IOLoop
-from tornado.iostream import IOStream
+from tornado.iostream import IOStream, StreamClosedError
 from tornado.log import app_log, gen_log
 from tornado.test.util import ignore_deprecation
-from tornado.testing import AsyncHTTPTestCase, ExpectLog, bind_unused_port, gen_test
+from tornado.testing import (
+    AsyncHTTPTestCase,
+    AsyncTestCase,
+    ExpectLog,
+    bind_unused_port,
+    gen_test,
+)
 from tornado.web import Application, RequestHandler, url
 
 
@@ -1007,3 +1014,108 @@ class HTTPErrorTestCase(unittest.TestCase):
         e = cm.exception
         self.assertEqual(str(e), "HTTP 403: Forbidden")
         self.assertEqual(repr(e), "HTTP 403: Forbidden")
+
+
+class _ScriptedHTTPClient(AsyncHTTPClient):
+    """AsyncHTTPClient test double replaying a scripted sequence of errors.
+
+    Each entry in ``script`` is either an exception (the request fails
+    with that error) or None (the request succeeds with a 200 response).
+    """
+
+    def initialize(self, script=None):
+        super().initialize()
+        self.script = list(script or [])
+        self.calls = 0
+        self.call_times = []
+
+    def fetch_impl(self, request, callback):
+        self.calls += 1
+        self.call_times.append(self.io_loop.time())
+        error = self.script.pop(0) if self.script else None
+        if error is not None:
+            response = HTTPResponse(request, 599, error=error)
+        else:
+            response = HTTPResponse(request, 200, buffer=BytesIO(b"ok"))
+        self.io_loop.add_callback(callback, response)
+
+
+class RequestRetryTestCase(AsyncTestCase):
+    def make_client(self, script):
+        client = _ScriptedHTTPClient(force_instance=True, script=script)
+        self.addCleanup(client.close)
+        return client
+
+    @gen_test
+    def test_retry_on_5xx(self):
+        client = self.make_client([HTTPError(500), HTTPError(503)])
+        response = yield client.fetch(
+            "http://example.com/", max_retries=3, retry_backoff_base=0.01
+        )
+        self.assertEqual(response.code, 200)
+        self.assertEqual(client.calls, 3)
+
+    @gen_test
+    def test_retry_on_stream_closed(self):
+        client = self.make_client([StreamClosedError()])
+        response = yield client.fetch(
+            "http://example.com/", max_retries=2, retry_backoff_base=0.01
+        )
+        self.assertEqual(response.code, 200)
+        self.assertEqual(client.calls, 2)
+
+    @gen_test
+    def test_retries_exhausted(self):
+        client = self.make_client([HTTPError(500)] * 5)
+        with self.assertRaises(HTTPError) as cm:
+            yield client.fetch(
+                "http://example.com/", max_retries=2, retry_backoff_base=0.01
+            )
+        self.assertEqual(cm.exception.code, 500)
+        self.assertEqual(client.calls, 3)
+
+    @gen_test
+    def test_no_retry_on_4xx(self):
+        client = self.make_client([HTTPError(404)])
+        with self.assertRaises(HTTPError) as cm:
+            yield client.fetch(
+                "http://example.com/", max_retries=3, retry_backoff_base=0.01
+            )
+        self.assertEqual(cm.exception.code, 404)
+        self.assertEqual(client.calls, 1)
+
+    @gen_test
+    def test_no_retry_by_default(self):
+        client = self.make_client([HTTPError(500)])
+        with self.assertRaises(HTTPError):
+            yield client.fetch("http://example.com/")
+        self.assertEqual(client.calls, 1)
+
+    @gen_test
+    def test_retry_with_raise_error_false(self):
+        client = self.make_client([HTTPError(500)])
+        response = yield client.fetch(
+            "http://example.com/",
+            max_retries=1,
+            retry_backoff_base=0.01,
+            raise_error=False,
+        )
+        self.assertEqual(response.code, 200)
+        self.assertEqual(client.calls, 2)
+
+    @gen_test
+    def test_backoff_is_exponential_with_jitter(self):
+        client = self.make_client([HTTPError(500)] * 3)
+        yield client.fetch(
+            "http://example.com/", max_retries=3, retry_backoff_base=0.1
+        )
+        self.assertEqual(client.calls, 4)
+        delays = [b - a for a, b in zip(client.call_times, client.call_times[1:])]
+        # The delay before attempt n is base * 2**(n-1) plus a random
+        # jitter in [0, base).  Allow some slack for scheduling.
+        self.assertGreaterEqual(delays[0], 0.09)
+        self.assertLess(delays[0], 0.3)
+        self.assertGreaterEqual(delays[1], 0.19)
+        self.assertLess(delays[1], 0.4)
+        self.assertGreaterEqual(delays[2], 0.39)
+        self.assertLess(delays[2], 0.6)

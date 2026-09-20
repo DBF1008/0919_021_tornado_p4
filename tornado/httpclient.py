@@ -38,6 +38,7 @@ To select ``curl_httpclient``, call `AsyncHTTPClient.configure` at startup::
 
 import datetime
 import functools
+import random
 import ssl
 import time
 import weakref
@@ -53,6 +54,7 @@ from tornado.concurrent import (
 )
 from tornado.escape import native_str, utf8
 from tornado.ioloop import IOLoop
+from tornado.iostream import StreamClosedError
 from tornado.util import Configurable
 
 
@@ -296,7 +298,30 @@ class AsyncHTTPClient(Configurable):
         request_proxy = _RequestProxy(request, self.defaults)
         future: Future[HTTPResponse] = Future()
 
+        max_retries = request_proxy.max_retries or 0
+        retry_backoff_base = request_proxy.retry_backoff_base
+        if retry_backoff_base is None:
+            retry_backoff_base = 0.5
+        attempts = [0]
+
         def handle_response(response: "HTTPResponse") -> None:
+            if (
+                response.error
+                and attempts[0] < max_retries
+                and _is_retryable_error(response.error)
+            ):
+                attempts[0] += 1
+                # Exponential backoff with random jitter to avoid
+                # thundering-herd retries against a struggling server.
+                delay = retry_backoff_base * (2 ** (attempts[0] - 1))
+                delay += random.uniform(0, retry_backoff_base)
+                self.io_loop.call_later(
+                    delay,
+                    self.fetch_impl,
+                    cast(HTTPRequest, request_proxy),
+                    handle_response,
+                )
+                return
             if response.error:
                 if raise_error or not response._error_is_response_code:
                     future_set_exception_unless_cancelled(future, response.error)
@@ -353,6 +378,8 @@ class HTTPRequest:
         proxy_password="",
         allow_nonstandard_methods=False,
         validate_cert=True,
+        max_retries=0,
+        retry_backoff_base=0.5,
     )
 
     def __init__(
@@ -392,6 +419,11 @@ class HTTPRequest:
         expect_100_continue: bool = False,
         decompress_response: bool | None = None,
         ssl_options: dict[str, Any] | ssl.SSLContext | None = None,
+        max_retries: int | None = None,
+        retry_backoff_base: float | None = None,
+        max_idle_connections: int | None = None,
+        idle_timeout: float | None = None,
+        body_truncation_threshold: int | None = None,
     ) -> None:
         r"""All parameters except ``url`` are optional.
 
@@ -481,6 +513,29 @@ class HTTPRequest:
            ``Expect: 100-continue`` header and wait for a continue response
            before sending the request body.  Only supported with
            ``simple_httpclient``.
+        :arg int max_retries: Number of times a failed request may be
+           retried by `AsyncHTTPClient.fetch`.  Retries are only attempted
+           for server errors (HTTP 5xx) and `tornado.iostream.StreamClosedError`,
+           with an exponential backoff.  Default is 0 (no retries).
+        :arg float retry_backoff_base: Base delay in seconds used to compute
+           the exponential backoff between retries; the delay for attempt
+           ``n`` is ``retry_backoff_base * 2 ** (n - 1)`` plus a random
+           jitter of up to ``retry_backoff_base`` seconds.  Default is 0.5.
+        :arg int max_idle_connections: Maximum number of idle keep-alive
+           connections kept in the connection pool for each
+           ``(host, port, is_ssl)`` tuple.  Only supported with
+           ``simple_httpclient``; overrides the client-level value.
+           Set to 0 to disable connection reuse for this request.
+        :arg float idle_timeout: How long (in seconds) an idle keep-alive
+           connection is kept in the pool before it is closed.  Only
+           supported with ``simple_httpclient``; overrides the
+           client-level value.
+        :arg int body_truncation_threshold: When ``max_body_size`` is not
+           set, response bodies larger than this many bytes are truncated:
+           the body is cut off at the threshold and the response is
+           delivered with ``HTTPResponse.truncated`` set to True instead
+           of failing or exhausting memory.  Only supported with
+           ``simple_httpclient``; overrides the client-level value.
 
         .. note::
 
@@ -546,6 +601,11 @@ class HTTPRequest:
         self.client_cert = client_cert
         self.ssl_options = ssl_options
         self.expect_100_continue = expect_100_continue
+        self.max_retries = max_retries
+        self.retry_backoff_base = retry_backoff_base
+        self.max_idle_connections = max_idle_connections
+        self.idle_timeout = idle_timeout
+        self.body_truncation_threshold = body_truncation_threshold
         self.start_time = time.time()
 
     @property
@@ -609,6 +669,11 @@ class HTTPResponse:
       plus ``queue``, which is the delay (if any) introduced by waiting for
       a slot under `AsyncHTTPClient`'s ``max_clients`` setting.
 
+    * ``truncated``: True if the response body was truncated because it
+      exceeded the configured truncation threshold (see the
+      ``body_truncation_threshold`` argument of `HTTPRequest`). In this
+      case ``body`` contains only the first part of the response.
+
     .. versionadded:: 5.1
 
        Added the ``start_time`` attribute.
@@ -638,6 +703,7 @@ class HTTPResponse:
         time_info: dict[str, float] | None = None,
         reason: str | None = None,
         start_time: float | None = None,
+        truncated: bool = False,
     ) -> None:
         if isinstance(request, _RequestProxy):
             self.request = request.request
@@ -667,6 +733,7 @@ class HTTPResponse:
         self.start_time = start_time
         self.request_time = request_time
         self.time_info = time_info or {}
+        self.truncated = truncated
 
     @property
     def body(self) -> bytes:
@@ -730,6 +797,21 @@ class HTTPClientError(Exception):
 
 
 HTTPError = HTTPClientError
+
+
+def _is_retryable_error(error: BaseException) -> bool:
+    """Return True if a failed request is worth retrying.
+
+    Retries are attempted for server-side errors (HTTP 5xx, including
+    the 599 pseudo-code used for timeouts and aborted connections) and
+    for `tornado.iostream.StreamClosedError`, which indicates the
+    connection was lost before a response was received.
+    """
+    if isinstance(error, StreamClosedError):
+        return True
+    if isinstance(error, HTTPError) and 500 <= error.code <= 599:
+        return True
+    return False
 
 
 class _RequestProxy:
